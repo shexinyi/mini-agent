@@ -1,0 +1,47 @@
+# 默认 mock：不访问外网，用关键词规则模拟 Function Calling，方便把循环看清楚。
+# 换成真实模型（PowerShell）：
+#   $env:LLM_MODE="openai"
+#   $env:LLM_API_KEY="sk-..."
+#   $env:LLM_BASE_URL="https://api.deepseek.com/v1"
+#   $env:LLM_MODEL="deepseek-chat"
+# 本地 Ollama：
+#   $env:LLM_MODE="openai"
+#   $env:LLM_BASE_URL="http://localhost:11434/v1"
+#   $env:LLM_API_KEY="ollama"
+#   $env:LLM_MODEL="qwen2.5"
+
+server:
+  port: 8082
+  servlet:
+    encoding:
+      charset: UTF-8
+      enabled: true
+      force: true
+
+spring:
+  application:
+    name: mini-agent
+  web:
+    resources:
+      cache:
+        period: 0
+
+agent:
+  max-steps: 8
+  trace-file: logs/agent-trace.jsonl
+  system-prompt: |
+    你是一个会使用工具的助手。
+    需要精确计算时调用 calculator。
+    需要当前时间时调用 get_current_time。
+    需要解释 agent、rag、react 时调用 search_knowledge。
+    不要编造工具结果。工具返回 ERROR 时换参数或换策略，不要用相同参数反复重试。
+    信息足够时直接用中文回答。
+  llm:
+    mode: ${LLM_MODE:mock}
+    base-url: ${LLM_BASE_URL:https://api.deepseek.com/v1}
+    api-key: ${LLM_API_KEY:}
+    model: ${LLM_MODEL:deepseek-chat}
+
+logging:
+  level:
+    com.miniagent: info

@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>最简 AI Agent</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f3f1eb;
+      --ink: #1d1a16;
+      --muted: #5e584f;
+      --card: #fffcf7;
+      --line: #e4ddd2;
+      --accent: #1f6b4a;
+      --accent-ink: #ffffff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font: 16px/1.6 "Segoe UI", "Microsoft YaHei", sans-serif;
+    }
+    main { max-width: 880px; margin: 0 auto; padding: 32px 20px 64px; }
+    h1 { font-size: 32px; line-height: 1.2; margin: 0 0 8px; }
+    h2 { font-size: 18px; margin: 0 0 8px; }
+    section {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 16px 18px;
+      margin-top: 14px;
+    }
+    .kicker { letter-spacing: 0.04em; color: var(--accent); font-size: 13px; margin: 0; }
+    .formula { font-size: 18px; margin: 8px 0; }
+    .hint { color: var(--muted); margin: 6px 0 0; }
+    ol { margin: 8px 0 0; padding-left: 20px; }
+    textarea, pre, button { font: inherit; }
+    textarea {
+      width: 100%;
+      margin-top: 6px;
+      padding: 10px 12px;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      background: #fff;
+      resize: vertical;
+    }
+    .row { display: flex; gap: 8px; align-items: center; margin-top: 10px; flex-wrap: wrap; }
+    button {
+      border: 0;
+      background: var(--accent);
+      color: var(--accent-ink);
+      border-radius: 8px;
+      padding: 8px 14px;
+      cursor: pointer;
+    }
+    button.secondary, button.example { background: #efeae2; color: var(--ink); }
+    .examples { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+    .answer { white-space: pre-wrap; min-height: 1.6em; }
+    pre {
+      white-space: pre-wrap;
+      word-break: break-word;
+      background: #f7f4ee;
+      border-radius: 8px;
+      padding: 10px 12px;
+      margin: 6px 0 0;
+      font-family: Consolas, "Microsoft YaHei", monospace;
+      font-size: 13px;
+    }
+    #memory { max-height: 420px; overflow: auto; }
+    .step { border-top: 1px solid var(--line); padding-top: 10px; margin-top: 10px; }
+    .step:first-child { border-top: 0; padding-top: 0; margin-top: 0; }
+    .label { color: var(--muted); font-size: 13px; margin-top: 6px; }
+    button:disabled { opacity: 0.55; cursor: wait; }
+    details { margin-top: 8px; }
+    summary { cursor: pointer; }
+    label { font-weight: 600; }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <p class="kicker">Spring Boot 示例</p>
+    <h1>最简 AI Agent</h1>
+    <p class="formula">LLM（大脑） + Tools（手脚） + Loop（循环） + Memory（记忆）</p>
+    <p id="mode" class="hint">正在读取运行模式…</p>
+  </header>
+
+  <section>
+    <h2>一轮请求里循环在做什么</h2>
+    <ol>
+      <li>你的话被追加进 memory。</li>
+      <li>memory 和工具的 JSON Schema 一起发给模型。</li>
+      <li>模型返回 tool_calls 时，执行工具，把结果以 role=tool 追加回 memory，然后回到第 2 步。</li>
+      <li>模型只返回文字，或达到 maxSteps，循环结束。</li>
+    </ol>
+  </section>
+
+  <section>
+    <h2>已注册的工具</h2>
+    <p class="hint">description 和 parameters 会原样放进请求的 tools 字段。这是写给模型看的，比代码注释重要。</p>
+    <div id="tools"></div>
+  </section>
+
+  <section>
+    <h2>试一句</h2>
+    <div class="examples">
+      <button type="button" class="example" id="demo-all" data-message="帮我算一下 128*37-96，再告诉我现在几点，最后解释一下什么是 RAG">计算 + 时间 + RAG</button>
+      <button type="button" class="example" id="demo-bad" data-message="帮我算一下 (">故意写错表达式</button>
+      <button type="button" class="example" id="demo-chat" data-message="你好">普通闲聊</button>
+    </div>
+    <form id="chat-form">
+      <label for="message">你的问题</label>
+      <textarea id="message" rows="3" placeholder="帮我算一下 128*37-96，再告诉我现在几点，最后解释一下什么是 RAG"></textarea>
+      <div class="row">
+        <button type="submit" id="send">发送</button>
+        <button type="button" class="secondary" id="reset">新对话</button>
+        <span id="status" class="hint"></span>
+      </div>
+    </form>
+    <p id="session" class="hint"></p>
+  </section>
+
+  <section>
+    <h2>回答</h2>
+    <div id="answer" class="answer" aria-live="polite">发送后，最后一条 assistant 文字会出现在这里。</div>
+  </section>
+
+  <section>
+    <h2>这一轮的工具轨迹</h2>
+    <div id="steps"></div>
+  </section>
+
+  <section>
+    <h2>短期记忆 messages</h2>
+    <p class="hint">下面这份数组会在下一轮整包发给模型。assistant 的 tool_calls 必须留在里面，后面的 role=tool 用 tool_call_id 对上。</p>
+    <pre id="memory">尚未开始对话。</pre>
+  </section>
+</main>
+<script>
+  let conversationId = null;
+
+  function el(tag, className, text) {
+    const node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text != null) node.textContent = text;
+    return node;
+  }
+
+  function pretty(raw) {
+    try {
+      return JSON.stringify(JSON.parse(raw), null, 2);
+    } catch (e) {
+      return raw == null ? "" : String(raw);
+    }
+  }
+
+  function setBusy(busy) {
+    document.querySelectorAll("button").forEach((button) => {
+      button.disabled = busy;
+    });
+  }
+
+  function renderSteps(steps) {
+    const root = document.querySelector("#steps");
+    root.replaceChildren();
+    if (!steps || steps.length === 0) {
+      root.appendChild(el("p", "hint", "这一轮没有工具调用。模型直接给出了文字。"));
+      return;
+    }
+    for (const step of steps) {
+      const card = el("article", "step");
+      card.append(
+        el("strong", null, "第 " + step.step + " 步 · " + step.tool),
+        el("div", "label", "参数"),
+        el("pre", null, pretty(step.arguments)),
+        el("div", "label", "返回"),
+        el("pre", null, step.result || "")
+      );
+      root.appendChild(card);
+    }
+  }
+
+  async function send() {
+    const sendBtn = document.querySelector("#send");
+    if (sendBtn.disabled) return;
+    const text = document.querySelector("#message").value.trim();
+    const status = document.querySelector("#status");
+    if (!text) {
+      status.textContent = "先写一句话";
+      return;
+    }
+    setBusy(true);
+    status.textContent = "正在跑 Agent 循环…";
+    try {
+      const body = { message: text };
+      if (conversationId) body.conversationId = conversationId;
+      const response = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data.error || ("请求失败 " + response.status));
+      }
+      conversationId = data.conversationId;
+      document.querySelector("#session").textContent = "会话 " + conversationId;
+      document.querySelector("#answer").textContent = data.answer || "（模型返回了空文字）";
+      status.textContent = data.finished ? "循环结束：模型给出了文字" : "循环停下了，看回答里的原因";
+      renderSteps(data.steps || []);
+      document.querySelector("#memory").textContent = JSON.stringify(data.messages, null, 2);
+    } catch (error) {
+      status.textContent = "";
+      document.querySelector("#answer").textContent = error.message || String(error);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function reset() {
+    if (conversationId) {
+      await fetch("/api/conversations/" + encodeURIComponent(conversationId), { method: "DELETE" });
+    }
+    conversationId = null;
+    document.querySelector("#session").textContent = "";
+    document.querySelector("#answer").textContent = "发送后，最后一条 assistant 文字会出现在这里。";
+    document.querySelector("#steps").replaceChildren();
+    document.querySelector("#memory").textContent = "尚未开始对话。";
+    document.querySelector("#status").textContent = "已清空这一段短期记忆";
+    document.querySelector("#message").value = "";
+  }
+
+  async function loadIntro() {
+    const [meta, tools] = await Promise.all([
+      fetch("/api/meta").then((response) => response.json()),
+      fetch("/api/tools").then((response) => response.json())
+    ]);
+    document.querySelector("#mode").textContent = meta.hint + " maxSteps=" + meta.maxSteps;
+    const root = document.querySelector("#tools");
+    root.replaceChildren();
+    for (const tool of tools) {
+      const details = document.createElement("details");
+      const summary = document.createElement("summary");
+      summary.textContent = tool.name + " — " + tool.description;
+      const pre = document.createElement("pre");
+      pre.textContent = JSON.stringify(tool.parameters, null, 2);
+      details.append(summary, pre);
+      root.appendChild(details);
+    }
+  }
+
+  document.querySelector("#chat-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    send();
+  });
+  document.querySelector("#message").addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+      event.preventDefault();
+      send();
+    }
+  });
+  document.querySelector("#reset").addEventListener("click", reset);
+  document.querySelectorAll(".example").forEach((button) => {
+    button.addEventListener("click", () => {
+      document.querySelector("#message").value = button.dataset.message;
+      send();
+    });
+  });
+  loadIntro().catch((error) => {
+    document.querySelector("#mode").textContent = error.message || String(error);
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,398 @@
+# 手写一个最简 AI Agent（Java）
+
+先说结论：**Agent = LLM（大脑）+ Tools（手脚）+ Loop（自主循环）+ Memory（上下文）**。
+
+去掉框架后，核心就是一个 `while` 循环：让模型决定下一步，如果它要调用工具就执行并把结果喂回去，直到它不再调工具为止。下面这份代码 ~250 行，单文件可跑。
+
+---
+
+## 一、整体结构
+
+```
+用户输入
+   │
+   ▼
+┌──────────────────────────────────────┐
+│  while (step < maxSteps)             │
+│    ① messages + tools → LLM          │
+│    ② LLM 返回 content? → 结束返回     │
+│    ③ LLM 返回 tool_calls? → 执行工具  │
+│    ④ 工具结果作为 role=tool 消息回填  │
+└──────────────────────────────────────┘
+```
+
+这就是 **ReAct / Function Calling 循环**，工业界所有 Agent（LangChain Agent、Spring AI、OpenAI Assistants）本质都是它。
+
+---
+
+## 二、完整代码 `MiniAgent.java`
+
+依赖只有一个：
+
+```xml
+<dependency>
+  <groupId>com.fasterxml.jackson.core</groupId>
+  <artifactId>jackson-databind</artifactId>
+  <version>2.17.0</version>
+</dependency>
+```
+
+```java
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+
+public class MiniAgent {
+
+    // ==================== 1. 工具抽象 ====================
+    /** 一个工具 = 名字 + 描述 + JSON Schema 参数 + 执行逻辑 */
+    interface Tool {
+        String name();
+        String description();
+        ObjectNode parameters();                       // JSON Schema
+        String execute(JsonNode args) throws Exception; // 返回值会作为字符串回填给模型
+    }
+
+    // ---------- 工具①：计算器 ----------
+    static class CalculatorTool implements Tool {
+        public String name() { return "calculator"; }
+        public String description() {
+            return "计算数学表达式，支持 + - * / 和括号。输入应为一个合法表达式字符串。";
+        }
+        public ObjectNode parameters() {
+            ObjectNode p = M.createObjectNode();
+            p.put("type", "object");
+            ObjectNode props = p.putObject("properties");
+            props.putObject("expression").put("type", "string").put("description", "如 (3+5)*2");
+            p.putArray("required").add("expression");
+            return p;
+        }
+        public String execute(JsonNode args) {
+            String expr = args.path("expression").asText();
+            double v = new Parser(expr).expr();
+            return expr + " = " + (v == Math.rint(v) ? String.valueOf((long) v) : String.valueOf(v));
+        }
+        // 极简递归下降求值器
+        static class Parser {
+            final String s; int i = 0;
+            Parser(String s) { this.s = s.replaceAll("\\s+", ""); }
+            double expr() {
+                double v = term();
+                while (i < s.length() && (s.charAt(i) == '+' || s.charAt(i) == '-')) {
+                    char op = s.charAt(i++);
+                    double r = term();
+                    v = op == '+' ? v + r : v - r;
+                }
+                return v;
+            }
+            double term() {
+                double v = factor();
+                while (i < s.length() && (s.charAt(i) == '*' || s.charAt(i) == '/')) {
+                    char op = s.charAt(i++);
+                    double r = factor();
+                    v = op == '*' ? v * r : v / r;
+                }
+                return v;
+            }
+            double factor() {
+                if (i < s.length() && s.charAt(i) == '(') {
+                    i++; double v = expr();
+                    if (i < s.length() && s.charAt(i) == ')') i++;
+                    return v;
+                }
+                if (i < s.length() && s.charAt(i) == '-') { i++; return -factor(); }
+                int st = i;
+                while (i < s.length() && (Character.isDigit(s.charAt(i)) || s.charAt(i) == '.')) i++;
+                if (st == i) throw new IllegalArgumentException("表达式非法，位置 " + i);
+                return Double.parseDouble(s.substring(st, i));
+            }
+        }
+    }
+
+    // ---------- 工具②：当前时间 ----------
+    static class TimeTool implements Tool {
+        public String name() { return "get_current_time"; }
+        public String description() { return "获取当前日期时间，无需参数。"; }
+        public ObjectNode parameters() {
+            ObjectNode p = M.createObjectNode();
+            p.put("type", "object");
+            p.putObject("properties");
+            return p;
+        }
+        public String execute(JsonNode args) {
+            return LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+        }
+    }
+
+    // ---------- 工具③：模拟知识库检索 ----------
+    static class MockSearchTool implements Tool {
+        private static final Map<String, String> KB = Map.of(
+            "agent", "AI Agent 是能感知环境、自主决策并调用工具完成目标的系统，核心是 LLM+Tools+Loop+Memory。",
+            "rag",   "RAG（检索增强生成）：先向量检索相关文档，再拼进 prompt 让模型基于事实回答。",
+            "react", "ReAct = Reasoning + Acting，让模型交替输出思考和动作，是 Agent 的经典范式。"
+        );
+        public String name() { return "search_knowledge"; }
+        public String description() { return "查询 AI/Agent 相关的内部知识库。"; }
+        public ObjectNode parameters() {
+            ObjectNode p = M.createObjectNode();
+            p.put("type", "object");
+            p.putObject("properties").putObject("query")
+                    .put("type", "string").put("description", "关键词，如 agent / rag / react");
+            p.putArray("required").add("query");
+            return p;
+        }
+        public String execute(JsonNode args) {
+            String q = args.path("query").asText("").toLowerCase();
+            for (var e : KB.entrySet()) {
+                if (q.contains(e.getKey())) return e.getValue();
+            }
+            return "知识库中未找到与「" + q + "」相关的内容。";
+        }
+    }
+
+    // ==================== 2. LLM 客户端 ====================
+    static class LlmClient {
+        private final HttpClient http = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(30)).build();
+        private final String baseUrl, apiKey, model;
+
+        LlmClient(String baseUrl, String apiKey, String model) {
+            this.baseUrl = baseUrl.endsWith("/") ? baseUrl.substring(0, baseUrl.length() - 1) : baseUrl;
+            this.apiKey = apiKey;
+            this.model = model;
+        }
+
+        /** 发一次 chat/completions，返回 choices[0].message 节点 */
+        JsonNode chat(ArrayNode messages, ArrayNode tools) throws Exception {
+            ObjectNode body = M.createObjectNode();
+            body.put("model", model);
+            body.set("messages", messages);
+            body.put("temperature", 0);
+            if (tools != null && !tools.isEmpty()) {
+                body.set("tools", tools);
+                body.put("tool_choice", "auto");
+            }
+
+            HttpRequest req = HttpRequest.newBuilder(URI.create(baseUrl + "/chat/completions"))
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", "Bearer " + apiKey)
+                    .timeout(Duration.ofSeconds(120))
+                    .POST(HttpRequest.BodyPublishers.ofString(M.writeValueAsString(body)))
+                    .build();
+
+            HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() != 200) {
+                throw new RuntimeException("LLM 调用失败 " + resp.statusCode() + ": " + resp.body());
+            }
+            return M.readTree(resp.body()).at("/choices/0/message");
+        }
+    }
+
+    // ==================== 3. Agent 本体 ====================
+    private static final ObjectMapper M = new ObjectMapper();
+
+    private final LlmClient llm;
+    private final Map<String, Tool> tools = new LinkedHashMap<>();
+    private final ArrayNode memory = M.createArrayNode(); // 短期记忆：整段对话上下文
+    private final int maxSteps;
+
+    public MiniAgent(LlmClient llm, List<Tool> toolList, int maxSteps) {
+        this.llm = llm;
+        this.maxSteps = maxSteps;
+        for (Tool t : toolList) tools.put(t.name(), t);
+    }
+
+    public String run(String userInput) {
+        memory.add(textMsg("user", userInput));
+
+        for (int step = 1; step <= maxSteps; step++) {
+            System.out.printf("  [step %d] 调用模型...%n", step);
+            JsonNode msg;
+            try {
+                msg = llm.chat(memory, buildToolsSchema());
+            } catch (Exception e) {
+                return "模型调用异常：" + e.getMessage();
+            }
+
+            // ★ 关键：assistant 消息必须原样回填（带 tool_calls），否则下一轮 API 会报错
+            memory.add(msg);
+
+            JsonNode toolCalls = msg.path("tool_calls");
+            // 分支 A：没有工具调用 → 模型给出了最终答案
+            if (!toolCalls.isArray() || toolCalls.isEmpty()) {
+                String content = msg.path("content").asText("");
+                System.out.println("  [step " + step + "] 模型输出最终答案");
+                return content;
+            }
+
+            // 分支 B：模型要求调工具，逐个执行并回填结果
+            for (JsonNode call : toolCalls) {
+                String callId = call.path("id").asText();
+                String toolName = call.at("/function/name").asText();
+                String argsRaw = call.at("/function/arguments").asText("{}");
+
+                System.out.println("  [step " + step + "] 调用工具: " + toolName + " 参数: " + argsRaw);
+
+                String result;
+                try {
+                    Tool tool = tools.get(toolName);
+                    if (tool == null) {
+                        result = "ERROR: 工具不存在 [" + toolName + "]";
+                    } else {
+                        JsonNode args = argsRaw.isBlank() ? M.createObjectNode() : M.readTree(argsRaw);
+                        result = tool.execute(args);
+                    }
+                } catch (Exception e) {
+                    // ★ 关键：工具失败不抛异常中断，而是把错误文本回填给模型，让它自己修正
+                    result = "ERROR: " + e.getClass().getSimpleName() + ": " + e.getMessage();
+                }
+
+                System.out.println("  [step " + step + "] 工具返回: " + result);
+
+                ObjectNode toolMsg = M.createObjectNode();
+                toolMsg.put("role", "tool");
+                toolMsg.put("tool_call_id", callId);
+                toolMsg.put("content", result);
+                memory.add(toolMsg);
+            }
+        }
+        return "已达到最大步数 " + maxSteps + "，任务未完成（防止死循环的兜底）。";
+    }
+
+    // ---------- 辅助方法 ----------
+    private ObjectNode textMsg(String role, String content) {
+        ObjectNode n = M.createObjectNode();
+        n.put("role", role);
+        n.put("content", content);
+        return n;
+    }
+
+    /** 把 Tool 列表转成 OpenAI Function Calling 的 tools schema */
+    private ArrayNode buildToolsSchema() {
+        ArrayNode arr = M.createArrayNode();
+        for (Tool t : tools.values()) {
+            ObjectNode fn = M.createObjectNode();
+            fn.put("name", t.name());
+            fn.put("description", t.description());
+            fn.set("parameters", t.parameters());
+            ObjectNode wrapper = M.createObjectNode();
+            wrapper.put("type", "function");
+            wrapper.set("function", fn);
+            arr.add(wrapper);
+        }
+        return arr;
+    }
+
+    // ==================== 4. 入口 ====================
+    public static void main(String[] args) {
+        String baseUrl = System.getenv().getOrDefault("LLM_BASE_URL", "https://api.deepseek.com/v1");
+        String apiKey  = System.getenv("LLM_API_KEY");
+        String model   = System.getenv().getOrDefault("LLM_MODEL", "deepseek-chat");
+
+        MiniAgent agent = new MiniAgent(
+                new LlmClient(baseUrl, apiKey, model),
+                List.of(new CalculatorTool(), new TimeTool(), new MockSearchTool()),
+                8);
+
+        Scanner sc = new Scanner(System.in);
+        System.out.println("Mini Agent 已启动（输入 exit 退出）");
+        while (true) {
+            System.out.print("\n你> ");
+            if (!sc.hasNextLine()) break;
+            String line = sc.nextLine();
+            if (line == null || line.isBlank()) continue;
+            if ("exit".equalsIgnoreCase(line.trim())) break;
+            System.out.println("Agent> " + agent.run(line));
+        }
+    }
+}
+```
+
+> 任何 OpenAI 兼容接口都能跑（DeepSeek / 通义 / Kimi / Ollama）。换 baseUrl 和 model 即可。
+> 本地 Ollama：`LLM_BASE_URL=http://localhost:11434/v1`，`LLM_API_KEY=ollama`，`LLM_MODEL=qwen2.5`。
+
+运行示例：
+
+```
+你> 帮我算一下 128*37-96，再告诉我现在几点，最后解释一下什么是 RAG
+
+  [step 1] 调用工具: calculator       参数: {"expression":"128*37-96"}
+  [step 1] 工具返回: 128*37-96 = 4640
+  [step 1] 调用工具: get_current_time  参数: {}
+  [step 1] 工具返回: 2025-06-01 14:23:07
+  [step 1] 调用工具: search_knowledge 参数: {"query":"rag"}
+  [step 1] 工具返回: RAG（检索增强生成）：...
+  [step 2] 模型输出最终答案
+Agent> 128*37-96 = 4640；现在是 2025-06-01 14:23:07；RAG 是...
+```
+
+---
+
+## 三、逐行拆解，面试要能讲清的点
+
+### 1. 为什么是"循环"而不是"一次调用"
+普通 LLM 调用是 `输入 → 输出`。Agent 多了**自主决策权**：模型自己决定「我要不要调工具、调哪个、传什么参数」。这个决策能力由 **Function Calling 协议**提供——你把工具的 JSON Schema 塞进 `tools` 字段，模型如果觉得需要工具，就会返回 `tool_calls` 而不是普通文本。
+
+### 2. Function Calling 三步握手（面试常问）
+```
+请求：messages + tools[{name, description, parameters(JSON Schema)}]
+响应：message.tool_calls = [{id, function:{name, arguments(JSON字符串)}}]
+回填：{role:"tool", tool_call_id:<id>, content:<执行结果字符串>}
+```
+三个坑：
+- **必须把 assistant 的 `tool_calls` 消息原样回填**到 messages，否则下一轮 API 报 400。
+- **`tool_call_id` 必须对上**，有多个工具调用时不能错配。
+- `arguments` 是**字符串**，不是对象，要二次 `readTree`；模型也可能给非法 JSON，要 try-catch。
+
+### 3. 工具执行失败怎么办 → 喂回模型，不要抛异常
+这是 Agent 工程化的核心思想：**工具的错误也是上下文的一部分**。模型看到 `ERROR: 除零异常` 会自己换个方式重试。如果直接抛异常，整个 Agent 就崩了。
+
+### 4. 防止死循环
+- `maxSteps` 硬上限（必须有）
+- 更进阶：检测**重复调用同一工具+同样参数**，超过 2 次就强制终止
+- 提示词里加"如果多次尝试仍失败，请直接告知用户"
+
+### 5. 工具设计的三条经验（很加分）
+- **description 是给模型看的 prompt**，要写清"什么时候用、参数什么格式"，比代码注释重要 10 倍。
+- **参数 schema 要严**（`required`、`enum`），模型幻觉会少很多。
+- **工具要幂等、要有超时、返回要短**。返回一大坨 JSON 会撑爆上下文。
+
+### 6. 记忆（Memory）
+现在这份代码的 `memory` 就是**短期记忆 = 完整对话历史**。真实场景的问题：
+- 上下文会无限膨胀 → 需要**滑窗 / 摘要压缩**
+- 会话重启即失忆 → 需要**长期记忆**（向量库存用户偏好、历史结论）
+- 面试可以说：分层记忆 = 工作记忆（当前任务）+ 情景记忆（历史对话摘要）+ 语义记忆（知识库/RAG）
+
+---
+
+## 四、面试可能追问 & 我的回答要点
+
+| 问题 | 回答要点 |
+|---|---|
+| **Agent 和 Workflow/Chain 区别？** | Chain 是**你写死的路径**（A→B→C）；Agent 是**模型在运行时决定路径**，控制流由 LLM 生成。代价是延迟高、不确定、更难测试。所以生产上常做「Workflow 为骨架 + Agent 处理开放分支」的混合架构。 |
+| **ReAct 和 Function Calling 区别？** | ReAct 是**提示词范式**（让模型输出 `Thought/Action/Observation` 文本，你自己解析）；Function Calling 是**模型原生能力**（结构化返回 tool_calls）。后者更稳、不用正则解析，现在主流都用后者。 |
+| **Agent 为什么会幻觉/跑偏？** | ① 工具描述不清 ② 上下文太长导致注意力稀释 ③ 工具返回格式不稳定。解法：工具 schema 严格化、每步结果结构化、加 critic/校验节点。 |
+| **多轮工具调用怎么并行？** | 模型一次返回多个 `tool_calls` 时（如上例），用线程池/`CompletableFuture` 并发执行，再按 `tool_call_id` 汇总回填。 |
+| **怎么评测 Agent？** | 端到端任务成功率 + 单步工具选择准确率 + 平均步数 + token 成本。必须做 **trace 日志**（每次 LLM 输入输出、工具调用全量落盘），否则没法 debug。 |
+| **这个最小实现的缺陷？** | 无流式、无上下文压缩、无重试限流、无结构化输出校验、工具串行执行、无持久化记忆。能说出来说明你知道工程化差在哪。 |
+
+---
+
+## 五、建议你下一步动手加的东西（面试前练手）
+
+1. **加 `maxTokens` 超限时摘要压缩记忆** —— 展示你会处理上下文管理
+2. **并行执行 tool_calls** —— 用 `CompletableFuture`，10 行
+3. **加一个"反思"节点**：工具返回 ERROR 时，插入一条 system 消息提示模型换策略
+4. **把 trace 落盘成 JSONL** —— 面试聊可观测性时有料
+
+跑通这 250 行，再回头看 LangChain / Spring AI 的 `AgentExecutor`，你会发现它们只是把上面这个 while 循环包装了一层 + 加了一堆回调钩子，没有魔法。
